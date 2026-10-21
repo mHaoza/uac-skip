@@ -9,6 +9,10 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "icons": "node scripts/make-icons.mjs",
+    "release": "node scripts/release.mjs",
+    "release:patch": "node scripts/release.mjs patch",
+    "release:minor": "node scripts/release.mjs minor",
+    "release:major": "node scripts/release.mjs major",
     "tauri": "tauri",
     "app:dev": "tauri dev",
     "app:build": "tauri build"

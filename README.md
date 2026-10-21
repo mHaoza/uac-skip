@@ -160,14 +160,30 @@ pnpm app:build
 
 ## 发布流程
 
-仓库带有 GitHub Actions 工作流 `.github/workflows/release.yml`，用提交信息触发发版：
+### 一键发版
 
 ```bash
-git commit -m "release: v0.0.1"
-git push
+pnpm release v0.1.1
 ```
 
-只要提交信息以 `release:` 开头，CI 就会：
+一条命令搞定：把版本号同步写入 `package.json`、`src-tauri/tauri.conf.json`、
+`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`，提交成 `release: v0.1.1`，然后推送。
+推送后 GitHub Actions 自动打包并创建 Release。
+
+版本号也可以不带 `v`（`pnpm release 0.1.1`），或直接写 `patch` / `minor` / `major`
+让脚本自己递增。常用选项：
+
+```bash
+pnpm release v0.1.1 --dry-run   # 只预览，不改文件不提交
+pnpm release v0.1.1 --no-push   # 提交但不推送
+```
+
+脚本会做这些保护：工作区必须干净（否则发版提交会混入无关改动）、版本号必须递增、
+标签不能已存在、版本号格式必须合法。
+
+### CI 做了什么
+
+工作流 `.github/workflows/release.yml` 由提交信息触发：
 
 1. 从提交信息里解析版本号（`release: v0.0.1` → `v0.0.1`），同步写入
    `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`；
@@ -177,7 +193,14 @@ git push
    （排除以 `release:` 开头的提交）汇总成发布说明；
 5. 创建 GitHub Release 并上传 exe 与校验和。
 
-也可以在 Actions 页面手动触发（`workflow_dispatch`），填一个版本号即可。
+也可以不用脚本，直接按约定提交：
+
+```bash
+git commit -m "release: v0.0.1"
+git push
+```
+
+或在 Actions 页面手动触发（`workflow_dispatch`），填一个版本号即可。
 
 > 版本号必须形如 `v0.0.1` 或 `0.0.1`（支持 `v1.0.0-beta.1` 这类预发布）；
 > 若标签已存在会直接失败，避免覆盖历史发布。
