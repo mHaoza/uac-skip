@@ -1,0 +1,31 @@
+# 依赖
+node_modules/
+target/
+
+# 构建产物
+dist/
+release-assets/
+RELEASE_NOTES.md
+src-tauri/gen/
+
+# 运行时数据（便携模式下写在 exe 同目录）
+apps.json
+apps.json.*
+.uacskip-write-probe-*
+
+# 本地配置
+*.local
+.env
+.env.*
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+npm-debug.log*
+pnpm-debug.log*

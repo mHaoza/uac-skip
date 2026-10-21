@@ -1,0 +1,192 @@
+name: Release
+
+# 提交信息以 release: 开头时自动打包并发布，例如：
+#   git commit -m "release: v0.0.1"
+# 发布说明会汇总「上一个 Release 到本次提交」之间的所有改动。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "版本号，例如 v0.0.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 构建便携版并发布
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'release:')
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      COMMIT_MSG: ${{ github.event.head_commit.message }}
+      INPUT_TAG: ${{ inputs.tag }}
+      EVENT_NAME: ${{ github.event_name }}
+
+    steps:
+      - name: 检出代码（含完整历史与标签）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 解析版本号
+        id: meta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ($env:EVENT_NAME -eq 'workflow_dispatch') {
+            $tag = "$env:INPUT_TAG".Trim()
+          } else {
+            $msg = "$env:COMMIT_MSG"
+            if ($msg -notmatch '^\s*release:\s*(\S+)') {
+              throw "提交信息需以 release: 开头，例如 release: v0.0.1（实际为：$msg）"
+            }
+            $tag = $Matches[1].Trim()
+          }
+
+          if ($tag -notmatch '^v?\d+\.\d+\.\d+([-+][0-9A-Za-z\.\-]+)?$') {
+            throw "版本号格式无效：$tag（应形如 v0.0.1）"
+          }
+          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+          $version = $tag.Substring(1)
+
+          git fetch --tags --force
+          $existing = git rev-parse -q --verify "refs/tags/$tag"
+          if ($existing) { throw "标签 $tag 已存在，请使用新的版本号" }
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "TAG=$tag" -Encoding utf8
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "VERSION=$version" -Encoding utf8
+          Write-Host "准备发布 $tag"
+
+      - name: 同步版本号到工程文件
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = "${{ steps.meta.outputs.version }}"
+
+          $targets = @(
+            @{ Path = 'src-tauri/tauri.conf.json'; Pattern = '(?<pre>"version"\s*:\s*")[^"]+(?<post>")' },
+            @{ Path = 'package.json';             Pattern = '(?<pre>"version"\s*:\s*")[^"]+(?<post>")' },
+            @{ Path = 'src-tauri/Cargo.toml';     Pattern = '(?m)(?<pre>^version\s*=\s*")[^"]+(?<post>")' }
+          )
+
+          foreach ($item in $targets) {
+            $text = Get-Content $item.Path -Raw
+            $regex = [regex]$item.Pattern
+            $updated = $regex.Replace($text, '${pre}' + $version + '${post}', 1)
+            Set-Content -Path $item.Path -Value $updated -NoNewline -Encoding utf8
+            Write-Host "已更新 $($item.Path) -> $version"
+          }
+
+          Get-Content 'src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json | Out-Null
+          Get-Content 'package.json' -Raw | ConvertFrom-Json | Out-Null
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 后端测试
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: 构建便携版可执行文件
+        run: pnpm exec tauri build --no-bundle
+
+      - name: 整理产物并生成发布说明
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $version = "${{ steps.meta.outputs.version }}"
+          $repo = "${{ github.repository }}"
+
+          # 1) 收集可执行文件
+          $exe = 'src-tauri/target/release/uac-skip.exe'
+          if (-not (Test-Path $exe)) { throw "未找到构建产物：$exe" }
+
+          New-Item -ItemType Directory -Force -Path 'release-assets' | Out-Null
+          $assetName = "UACSkip-$version-x64-portable.exe"
+          $assetPath = "release-assets/$assetName"
+          Copy-Item $exe $assetPath -Force
+
+          $hash = (Get-FileHash $assetPath -Algorithm SHA256).Hash.ToLower()
+          $sizeMb = [math]::Round((Get-Item $assetPath).Length / 1MB, 2)
+          "$hash  $assetName" | Set-Content -Path "release-assets/$assetName.sha256" -Encoding utf8
+          Write-Host "产物 $assetName ($sizeMb MB) sha256=$hash"
+
+          # 2) 找到上一个 Release，汇总这之间的提交
+          $prev = ''
+          try { $prev = (gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>$null) } catch { $prev = '' }
+          if (-not $prev) {
+            try { $prev = (git describe --tags --abbrev=0 2>$null) } catch { $prev = '' }
+          }
+          $prev = "$prev".Trim()
+
+          if ($prev) { $range = "$prev..HEAD" } else { $range = 'HEAD' }
+          Write-Host "变更范围：$range"
+
+          $commits = @(git log $range --no-merges --invert-grep --grep='^release:' --pretty=format:'- %s (%h)')
+          if ($commits.Count -eq 0) { $commits = @('- 本次发布没有新的代码改动') }
+
+          # 3) 生成发布说明
+          $lines = @()
+          $lines += '## 变更内容'
+          $lines += ''
+          $lines += $commits
+          $lines += ''
+          $lines += '## 下载'
+          $lines += ''
+          $lines += "**$assetName** —— 单文件绿色版，双击即可运行，无需安装。"
+          $lines += ''
+          $lines += '- 需要 Windows 10 / 11 与 WebView2 运行时（Win11 及已更新的 Win10 已内置）'
+          $lines += '- 配置保存在 exe 同目录的 apps.json，整个文件夹可以随意复制迁移'
+          $lines += '- 首次为程序启用「免 UAC 启动」时需要一次管理员授权，之后不再弹窗'
+          $lines += ''
+          $lines += "SHA256：$hash"
+          if ($prev) {
+            $lines += ''
+            $lines += "**完整对比**：https://github.com/$repo/compare/$prev...$tag"
+          }
+
+          Set-Content -Path 'RELEASE_NOTES.md' -Value ($lines -join "`n") -Encoding utf8
+          Write-Host "发布说明已生成"
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: UACSkip ${{ steps.meta.outputs.tag }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            release-assets/*.exe
+            release-assets/*.sha256
+          draft: false
+          prerelease: false
+          make_latest: true
