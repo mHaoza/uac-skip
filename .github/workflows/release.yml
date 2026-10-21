@@ -42,35 +42,44 @@ jobs:
         id: meta
         shell: pwsh
         run: |
+          # 关闭「原生命令非零退出即报错」，否则探测类 git 命令会中断整个步骤
+          $PSNativeCommandUseErrorActionPreference = $false
           $ErrorActionPreference = 'Stop'
 
-          if ($env:EVENT_NAME -eq 'workflow_dispatch') {
-            $tag = "$env:INPUT_TAG".Trim()
-          } else {
-            $msg = "$env:COMMIT_MSG"
-            if ($msg -notmatch '^\s*release:\s*(\S+)') {
-              throw "提交信息需以 release: 开头，例如 release: v0.0.1（实际为：$msg）"
+          try {
+            if ($env:EVENT_NAME -eq 'workflow_dispatch') {
+              $tag = "$env:INPUT_TAG".Trim()
+            } else {
+              $msg = "$env:COMMIT_MSG"
+              if ($msg -notmatch '^\s*release:\s*(\S+)') {
+                throw "提交信息需以 release: 开头，例如 release: v0.0.1（实际为：$msg）"
+              }
+              $tag = $Matches[1].Trim()
             }
-            $tag = $Matches[1].Trim()
+
+            if ($tag -notmatch '^v?\d+\.\d+\.\d+([-+][0-9A-Za-z\.\-]+)?$') {
+              throw "版本号格式无效：$tag（应形如 v0.0.1）"
+            }
+            if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+            $version = $tag.Substring(1)
+
+            # git tag --list 总是返回 0，不会因为「标签不存在」而中断
+            try { git fetch --tags --force 2>&1 | Out-Null } catch { Write-Host "拉取标签失败，继续" }
+            $existing = @(git tag --list $tag)
+            if ($existing.Count -gt 0) { throw "标签 $tag 已存在，请使用新的版本号" }
+
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "TAG=$tag" -Encoding utf8
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "VERSION=$version" -Encoding utf8
+            Write-Host "准备发布 $tag"
+          } catch {
+            Write-Host "::error::解析版本号失败: $($_.Exception.Message)"
+            throw
           }
-
-          if ($tag -notmatch '^v?\d+\.\d+\.\d+([-+][0-9A-Za-z\.\-]+)?$') {
-            throw "版本号格式无效：$tag（应形如 v0.0.1）"
-          }
-          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
-          $version = $tag.Substring(1)
-
-          git fetch --tags --force
-          $existing = git rev-parse -q --verify "refs/tags/$tag"
-          if ($existing) { throw "标签 $tag 已存在，请使用新的版本号" }
-
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "TAG=$tag" -Encoding utf8
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "VERSION=$version" -Encoding utf8
-          Write-Host "准备发布 $tag"
 
       - name: 同步版本号到工程文件
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $ErrorActionPreference = 'Stop'
           $version = "${{ steps.meta.outputs.version }}"
 
@@ -122,61 +131,67 @@ jobs:
       - name: 整理产物并生成发布说明
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $ErrorActionPreference = 'Stop'
           $tag = "${{ steps.meta.outputs.tag }}"
           $version = "${{ steps.meta.outputs.version }}"
           $repo = "${{ github.repository }}"
 
-          # 1) 收集可执行文件
-          $exe = 'src-tauri/target/release/uac-skip.exe'
-          if (-not (Test-Path $exe)) { throw "未找到构建产物：$exe" }
+          try {
+            # 1) 收集可执行文件
+            $exe = 'src-tauri/target/release/uac-skip.exe'
+            if (-not (Test-Path $exe)) { throw "未找到构建产物：$exe" }
 
-          New-Item -ItemType Directory -Force -Path 'release-assets' | Out-Null
-          $assetName = "UACSkip-$version-x64-portable.exe"
-          $assetPath = "release-assets/$assetName"
-          Copy-Item $exe $assetPath -Force
+            New-Item -ItemType Directory -Force -Path 'release-assets' | Out-Null
+            $assetName = "UACSkip-$version-x64-portable.exe"
+            $assetPath = "release-assets/$assetName"
+            Copy-Item $exe $assetPath -Force
 
-          $hash = (Get-FileHash $assetPath -Algorithm SHA256).Hash.ToLower()
-          $sizeMb = [math]::Round((Get-Item $assetPath).Length / 1MB, 2)
-          "$hash  $assetName" | Set-Content -Path "release-assets/$assetName.sha256" -Encoding utf8
-          Write-Host "产物 $assetName ($sizeMb MB) sha256=$hash"
+            $hash = (Get-FileHash $assetPath -Algorithm SHA256).Hash.ToLower()
+            $sizeMb = [math]::Round((Get-Item $assetPath).Length / 1MB, 2)
+            "$hash  $assetName" | Set-Content -Path "release-assets/$assetName.sha256" -Encoding utf8
+            Write-Host "产物 $assetName ($sizeMb MB) sha256=$hash"
 
-          # 2) 找到上一个 Release，汇总这之间的提交
-          $prev = ''
-          try { $prev = (gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>$null) } catch { $prev = '' }
-          if (-not $prev) {
-            try { $prev = (git describe --tags --abbrev=0 2>$null) } catch { $prev = '' }
-          }
-          $prev = "$prev".Trim()
+            # 2) 找到上一个 Release，汇总这之间的提交
+            $prev = ''
+            try { $prev = (gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>$null) } catch { $prev = '' }
+            if (-not $prev) {
+              try { $prev = (git describe --tags --abbrev=0 2>$null) } catch { $prev = '' }
+            }
+            $prev = "$prev".Trim()
 
-          if ($prev) { $range = "$prev..HEAD" } else { $range = 'HEAD' }
-          Write-Host "变更范围：$range"
+            if ($prev) { $range = "$prev..HEAD" } else { $range = 'HEAD' }
+            Write-Host "变更范围：$range"
 
-          $commits = @(git log $range --no-merges --invert-grep --grep='^release:' --pretty=format:'- %s (%h)')
-          if ($commits.Count -eq 0) { $commits = @('- 本次发布没有新的代码改动') }
+            $commits = @(git log $range --no-merges --invert-grep --grep='^release:' --pretty=format:'- %s (%h)')
+            if ($commits.Count -eq 0) { $commits = @('- 本次发布没有新的代码改动') }
 
-          # 3) 生成发布说明
-          $lines = @()
-          $lines += '## 变更内容'
-          $lines += ''
-          $lines += $commits
-          $lines += ''
-          $lines += '## 下载'
-          $lines += ''
-          $lines += "**$assetName** —— 单文件绿色版，双击即可运行，无需安装。"
-          $lines += ''
-          $lines += '- 需要 Windows 10 / 11 与 WebView2 运行时（Win11 及已更新的 Win10 已内置）'
-          $lines += '- 配置保存在 exe 同目录的 apps.json，整个文件夹可以随意复制迁移'
-          $lines += '- 首次为程序启用「免 UAC 启动」时需要一次管理员授权，之后不再弹窗'
-          $lines += ''
-          $lines += "SHA256：$hash"
-          if ($prev) {
+            # 3) 生成发布说明
+            $lines = @()
+            $lines += '## 变更内容'
             $lines += ''
-            $lines += "**完整对比**：https://github.com/$repo/compare/$prev...$tag"
-          }
+            $lines += $commits
+            $lines += ''
+            $lines += '## 下载'
+            $lines += ''
+            $lines += "**$assetName** —— 单文件绿色版，双击即可运行，无需安装。"
+            $lines += ''
+            $lines += '- 需要 Windows 10 / 11 与 WebView2 运行时（Win11 及已更新的 Win10 已内置）'
+            $lines += '- 配置保存在 exe 同目录的 apps.json，整个文件夹可以随意复制迁移'
+            $lines += '- 首次为程序启用「免 UAC 启动」时需要一次管理员授权，之后不再弹窗'
+            $lines += ''
+            $lines += "SHA256：$hash"
+            if ($prev) {
+              $lines += ''
+              $lines += "**完整对比**：https://github.com/$repo/compare/$prev...$tag"
+            }
 
-          Set-Content -Path 'RELEASE_NOTES.md' -Value ($lines -join "`n") -Encoding utf8
-          Write-Host "发布说明已生成"
+            Set-Content -Path 'RELEASE_NOTES.md' -Value ($lines -join "`n") -Encoding utf8
+            Write-Host "发布说明已生成"
+          } catch {
+            Write-Host "::error::整理产物失败: $($_.Exception.Message)"
+            throw
+          }
 
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
