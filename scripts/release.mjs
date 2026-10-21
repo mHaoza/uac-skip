@@ -222,11 +222,33 @@ if (skipPush) {
 }
 
 try {
-  git(["push", "origin", branch], { stdio: "inherit" });
-} catch {
+  const output = execFileSync("git", ["push", "origin", branch], {
+    cwd: ROOT,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (output) process.stdout.write(output);
+} catch (error) {
+  const detail = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+  if (detail) process.stdout.write(detail);
+
+  if (/non-fast-forward|fetch first|behind its remote|rejected/i.test(detail)) {
+    fail(
+      "推送被拒绝：远程分支上有你本地没有的提交（历史已分叉）",
+      [
+        "若只是远程多出无关提交，先合并再重发：",
+        `    git pull --rebase origin ${branch}`,
+        "    git reset --hard HEAD~1   # 撤销本次版本号提交",
+        `    pnpm release ${tag}`,
+        "若确认远程那版是旧的、要用本地整体替换：",
+        `    git push --force-with-lease origin ${branch}`,
+      ].join("\n"),
+    );
+  }
+
   fail(
     "推送失败，提交已保存在本地",
-    `网络或权限问题排除后手动执行：git push origin ${branch}`,
+    `排除网络或权限问题后手动执行：git push origin ${branch}`,
   );
 }
 
