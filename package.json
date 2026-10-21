@@ -1,7 +1,7 @@
 {
   "name": "uac-skip",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "UACSkip · 可视化管理免 UAC 弹窗的应用启动",
   "scripts": {
